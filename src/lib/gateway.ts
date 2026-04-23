@@ -1,7 +1,7 @@
 /**
  * EagleOne Command — Gateway Client
- * WebSocket + REST client for OpenClaw gateway
- * Phase 1: demo mode; Phase 2: real OpenClaw streaming
+ * Connects to OpenClaw via OpenAI-compatible Responses API (/v1/responses)
+ * Falls back to demo mode if gateway is unreachable
  */
 
 export type GatewayStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
@@ -15,29 +15,28 @@ export interface GatewayMessage {
 type MessageHandler = (msg: GatewayMessage) => void
 type StatusHandler = (status: GatewayStatus) => void
 
-const GATEWAY_WS_URL =
-  import.meta.env.VITE_GS_URL || 'ws://127.0.0.1:56565/api/v1/chat/stream'
-const GATEWAY_REST_URL =
-  import.meta.env.VITE_REST_URL || 'http://127.0.0.1:56565/api/v1/chat'
+// OpenClaw gateway on loopback
+const GATEWAY_URL =
+  import.meta.env.VITE_GATEWAY_URL || '/v1'
+const GATEWAY_TOKEN =
+  import.meta.env.VITE_OPENCLAW_TOKEN || ''
+const AGENT_MODEL =
+  import.meta.env.VITE_OPENCLAW_AGENT || 'openclaw'
 
 export class GatewayClient {
-  private ws: WebSocket | null = null
   private status: GatewayStatus = 'disconnected'
   private messageHandlers: Set<MessageHandler> = new Set()
   private statusHandlers: Set<StatusHandler> = new Set()
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  private pingTimer: ReturnType<typeof setInterval> | null = null
   private demoMode = false
 
   constructor() {
-    // Detect if gateway is reachable — if not, fall back to demo mode
     this.checkGatewayReachability()
   }
 
   private async checkGatewayReachability(): Promise<void> {
     try {
-      const res = await fetch(GATEWAY_REST_URL.replace('/api/v1/chat', '/health'), {
-        method: 'GET',
+      const res = await fetch(`${GATEWAY_URL}/v1/models`, {
+        headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
         signal: AbortSignal.timeout(2000),
       })
       if (!res.ok) throw new Error('Gateway unreachable')
@@ -47,55 +46,7 @@ export class GatewayClient {
     }
   }
 
-  /** Establish WebSocket connection to OpenClaw gateway */
-  connect(): void {
-    if (this.demoMode) {
-      this.setStatus('connected')
-      return
-    }
-
-    if (this.ws?.readyState === WebSocket.OPEN) return
-
-    this.setStatus('connecting')
-
-    try {
-      this.ws = new WebSocket(GATEWAY_WS_URL)
-
-      this.ws.onopen = () => {
-        this.setStatus('connected')
-        this.startPing()
-      }
-
-      this.ws.onmessage = (event: MessageEvent) => {
-        // SSE format: "data: {\"token\":\"word \"}\n\n"
-        const raw = event.data as string
-        const lines = raw.split('\n').filter(l => l.startsWith('data: '))
-        for (const line of lines) {
-          try {
-            const data = JSON.parse(line.slice(6)) as GatewayMessage
-            this.messageHandlers.forEach(h => h(data))
-          } catch {
-            // ignore parse errors
-          }
-        }
-      }
-
-      this.ws.onerror = () => {
-        this.setStatus('error')
-      }
-
-      this.ws.onclose = () => {
-        this.setStatus('disconnected')
-        this.stopPing()
-        this.scheduleReconnect()
-      }
-    } catch {
-      this.demoMode = true
-      this.setStatus('connected')
-    }
-  }
-
-  /** Send a message and stream the response */
+  /** Send a message and stream the response via OpenAI Responses API */
   async sendMessage(
     message: string,
     onChunk?: (token: string) => void,
@@ -107,29 +58,52 @@ export class GatewayClient {
       return
     }
 
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.connect()
-      // Wait briefly for connect
-      await new Promise(r => setTimeout(r, 500))
-    }
+    this.setStatus('connecting')
 
     try {
-      // Send via REST with SSE — more reliable than raw WS for streaming
-      const res = await fetch(GATEWAY_REST_URL, {
+      const res = await fetch(`${GATEWAY_URL}/v1/responses`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-        body: JSON.stringify({ message, stream: true }),
-        signal: AbortSignal.timeout(30000),
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${GATEWAY_TOKEN}`,
+        },
+        body: JSON.stringify({
+          model: AGENT_MODEL,
+          stream: true,
+          input: message,
+        }),
+        signal: AbortSignal.timeout(60000),
       })
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) {
+        const err = await res.text()
+        throw new Error(`HTTP ${res.status}: ${err}`)
+      }
 
-      const reader = res.body?.getReader()
-      if (!reader) throw new Error('No response body')
+      this.setStatus('connected')
+      await this.parseSSEResponse(res, onChunk, onDone)
+      onDone?.()
+    } catch (err) {
+      this.setStatus('error')
+      onError?.(err instanceof Error ? err.message : 'Unknown error')
+      // Fallback to demo on error
+      await this.demoStream(message, onChunk, onDone)
+    }
+  }
 
-      const decoder = new TextDecoder()
-      let buffer = ''
+  /** Parse SSE stream from OpenAI Responses API */
+  private async parseSSEResponse(
+    res: Response,
+    onChunk?: (token: string) => void,
+    onDone?: () => void
+  ): Promise<void> {
+    if (!res.body) throw new Error('No response body')
 
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    try {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
@@ -139,14 +113,23 @@ export class GatewayClient {
         buffer = lines.pop() ?? ''
 
         for (const line of lines) {
+          if (line.startsWith('event: ')) continue
           if (line.startsWith('data: ')) {
+            const dataStr = line.slice(6).trim()
+            if (dataStr === '[DONE]') continue
+
             try {
-              const data = JSON.parse(line.slice(6)) as GatewayMessage
-              if (data.token) onChunk?.(data.token)
-              if (data.done) onDone?.()
-              if (data.error) onError?.(data.error)
+              const event = JSON.parse(dataStr)
+              // OpenAI Responses API streaming events
+              if (event.type === 'response.output_text.delta') {
+                onChunk?.(event.delta)
+              } else if (event.type === 'response.done') {
+                onDone?.()
+              } else if (event.type === 'error') {
+                throw new Error(event.error?.message || 'Streaming error')
+              }
             } catch {
-              // ignore
+              // ignore parse errors
             }
           }
         }
@@ -155,9 +138,10 @@ export class GatewayClient {
       // Process remaining buffer
       if (buffer.startsWith('data: ')) {
         try {
-          const data = JSON.parse(buffer.slice(6)) as GatewayMessage
-          if (data.token) onChunk?.(data.token)
-          if (data.done) onDone?.()
+          const event = JSON.parse(buffer.slice(6).trim())
+          if (event.type === 'response.output_text.delta') {
+            onChunk?.(event.delta)
+          }
         } catch {
           // ignore
         }
@@ -165,17 +149,13 @@ export class GatewayClient {
 
       onDone?.()
     } catch (err) {
-      onError?.(err instanceof Error ? err.message : 'Unknown error')
-      // Fallback to demo on error
-      await this.demoStream(message, onChunk, onDone)
+      throw err
     }
   }
 
-  /** Heartbeat ping to keep WebSocket alive */
+  /** Heartbeat ping */
   ping(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'ping' }))
-    }
+    // No-op for HTTP-based client
   }
 
   /** Register a handler for incoming messages */
@@ -201,10 +181,6 @@ export class GatewayClient {
 
   /** Disconnect and clean up */
   disconnect(): void {
-    this.stopPing()
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
-    this.ws?.close()
-    this.ws = null
     this.setStatus('disconnected')
   }
 
@@ -213,25 +189,6 @@ export class GatewayClient {
   private setStatus(status: GatewayStatus): void {
     this.status = status
     this.statusHandlers.forEach(h => h(status))
-  }
-
-  private startPing(): void {
-    this.pingTimer = setInterval(() => this.ping(), 25000)
-  }
-
-  private stopPing(): void {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer)
-      this.pingTimer = null
-    }
-  }
-
-  private scheduleReconnect(): void {
-    if (this.reconnectTimer) return
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null
-      this.connect()
-    }, 5000)
   }
 
   /** Demo mode streaming for Phase 1 when gateway is unreachable */
@@ -245,13 +202,20 @@ export class GatewayClient {
       status: "All systems nominal. Gateway: connected, Agents: 6/6 active, Memory: 84%.",
       wmt: "WMT: $127.26. Daily delta: +$0.43. Liquidation tracker running.",
       help: "Available commands: status, wmt, agents, memory, or ask me anything about the Adler Synod portfolio.",
+      apex: "EagleApex reporting: WMT position under review. Capital gains strategy active. RV park underwriting in progress.",
+      scout: "EagleScout reporting: 3 new PNW RV park leads identified. Cap rates 5.2–7.1%. Deep dive queued.",
+      tek: "EagleTek reporting: Brinkley 4100 systems nominal. Ram 3500 oil change due in 500 miles. RV Tech prep on track.",
+      search: "EagleSearch reporting: Walmart sector sentiment neutral-to-positive. No regulatory headwinds. RV industry growth +8.2% YoY.",
+      devops: "EagleDevOps reporting: Mac Mini uptime 99.97%. Gateway stable. Memory systems healthy. CI/CD pipeline nominal.",
+      forge: "EagleForge reporting: Sprint complete. Build → QA → Deploy pipeline active. Next sprint queued for Phase 2 enhancements.",
     }
 
-    const demo = responses[message.toLowerCase()] ?? responses.default
+    const key = message.toLowerCase().replace(/[^a-z]/g, '')
+    const demo = responses[key] ?? responses.default
     const words = demo.split(' ')
 
     for (let i = 0; i < words.length; i++) {
-      await new Promise(r => setTimeout(r, 40))
+      await new Promise(r => setTimeout(r, 35))
       onChunk?.(words[i] + (i < words.length - 1 ? ' ' : ''))
     }
 
