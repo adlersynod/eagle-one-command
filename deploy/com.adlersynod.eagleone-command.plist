@@ -34,6 +34,8 @@
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>OPENCLAW_GATEWAY_TOKEN</key>
+        <string>b64ee22c34d284744fb4a6406b8d9924ba68f81b90cbd4d0b6e9ac6b339baf67</string>
     </dict>
     
     <key>ProcessType</key>
