@@ -27,7 +27,7 @@ const defaultAgents: AgentData[] = [
   { id: 'eagle-scout', name: 'EagleScout', specialty: 'Research', status: 'idle', lastResponse: '', streamState: 'idle' },
   { id: 'eagle-tek', name: 'EagleTek', specialty: 'Technical', status: 'idle', lastResponse: '', streamState: 'idle' },
   { id: 'eagle-search', name: 'EagleSearch', specialty: 'Intelligence', status: 'idle', lastResponse: '', streamState: 'idle' },
-  { id: 'eagle-dev', name: 'EagleDev', specialty: 'DevOps', status: 'idle', lastResponse: '', streamState: 'idle' },
+  { id: 'eagle-devops', name: 'EagleDevOps', specialty: 'DevOps / EagleForge', status: 'idle', lastResponse: '', streamState: 'idle' },
   { id: 'eagle-forge', name: 'EagleForge', specialty: 'Engineering', status: 'idle', lastResponse: '', streamState: 'idle' },
 ];
 
